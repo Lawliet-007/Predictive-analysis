@@ -1,0 +1,94 @@
+import os
+import pandas as pd
+from fastapi import FastAPI, UploadFile, HTTPException
+from pydantic import BaseModel
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, f1_score
+from sklearn.tree import DecisionTreeClassifier
+import uvicorn
+import joblib
+
+# Initialize FastAPI app
+app = FastAPI()
+
+# Global variables
+model = None
+X_columns = []
+
+# File paths
+MODEL_FILE = "model.pkl"
+
+# Endpoint to upload dataset
+@app.post("/upload")
+async def upload_file(file: UploadFile):
+    if not file.filename.endswith('.csv'):
+        raise HTTPException(status_code=400, detail="Only CSV files are supported.")
+
+    file_path = f"uploaded_{file.filename}"
+    with open(file_path, "wb") as f:
+        f.write(await file.read())
+
+    # Load data to validate structure
+    global X_columns
+    df = pd.read_csv(file_path)
+    if not {'Machine_ID', 'Temperature', 'Run_Time', 'Downtime_Flag'}.issubset(df.columns):
+        raise HTTPException(status_code=400, detail="Dataset must contain 'Machine_ID', 'Temperature', 'Run_Time', and 'Downtime_Flag' columns.")
+
+    X_columns = ['Temperature', 'Run_Time']
+    return {"message": "File uploaded successfully.", "file_path": file_path}
+
+# Endpoint to train the model
+@app.post("/train")
+def train_model(file_path: str, model_type: str = "logistic_regression"):
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Dataset file not found.")
+
+    df = pd.read_csv(file_path)
+    X = df[X_columns]
+    y = df['Downtime_Flag']
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+    global model
+    if model_type == "logistic_regression":
+        model = LogisticRegression()
+    elif model_type == "decision_tree":
+        model = DecisionTreeClassifier()
+    else:
+        raise HTTPException(status_code=400, detail="Invalid model type. Use 'logistic_regression' or 'decision_tree'.")
+
+    model.fit(X_train, y_train)
+    
+    # Save model
+    joblib.dump(model, MODEL_FILE)
+
+    # Metrics
+    y_pred = model.predict(X_test)
+    accuracy = accuracy_score(y_test, y_pred)
+    f1 = f1_score(y_test, y_pred)
+
+    return {"message": "Model trained successfully.", "accuracy": accuracy, "f1_score": f1}
+
+# Endpoint to predict downtime
+class PredictionInput(BaseModel):
+    Temperature: float
+    Run_Time: float
+
+@app.post("/predict")
+def predict(input_data: PredictionInput):
+    global model
+    if model is None and os.path.exists(MODEL_FILE):
+        model = joblib.load(MODEL_FILE)
+
+    if model is None:
+        raise HTTPException(status_code=400, detail="No trained model available. Train a model first.")
+
+    input_df = pd.DataFrame([input_data.dict()])
+    prediction = model.predict(input_df)[0]
+    confidence = max(model.predict_proba(input_df)[0])
+
+    return {"Downtime": "Yes" if prediction == 1 else "No", "Confidence": round(confidence, 2)}
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
